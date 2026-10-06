@@ -12,7 +12,7 @@ android {
         applicationId = "ru.cw.launcher"
         minSdk = 26
         targetSdk = 35
-        versionCode = 24019
+        versionCode = 24022
         versionName = "2.3.7"
     }
 

@@ -92,17 +92,7 @@ object PhoneVm {
         val jvm = File(home, "lib/server/libjvm.so")
         if (!jvm.isFile) throw IOException("В Java 17 нет lib/server/libjvm.so")
         val nativeDir = context.applicationInfo.nativeLibraryDir
-        val jreLib = File(home, "lib").absolutePath
         val jvmLib = jvm.parentFile?.absolutePath ?: throw IOException("В Java 17 нет папки lib/server")
-        val systemLibs = if (translatedPc()) {
-            listOf("/system/lib64/arm64", "/system/lib64/houdini/arm64", "/system/lib64")
-        } else {
-            listOf("/system/lib64")
-        }
-        val ld = listOf(jvmLib, jreLib, nativeDir)
-            .plus(systemLibs)
-            .plus(listOf("/vendor/lib64", "/vendor/lib64/hw"))
-            .joinToString(":")
         set("JAVA_HOME", home.absolutePath)
         set("HOME", AppPaths.root.absolutePath)
         set("TMPDIR", AppPaths.tmp.absolutePath)
@@ -118,18 +108,28 @@ object PhoneVm {
         set("LIBGL_GLXRECYCLE", "0")
         set("FORCE_VSYNC", if (forceVsync) "true" else "false")
         set("MESA_GLSL_CACHE_DIR", AppPaths.cache.absolutePath)
-        set("LD_LIBRARY_PATH", ld)
         set("PATH", File(home, "bin").absolutePath + ":" + (Os.getenv("PATH") ?: ""))
         // The screen bridge must be loaded first. Its native methods are registered
         // only after that, and setLdLibraryPath is one of them.
         CallbackBridge.setContext(context)
         CallbackBridge.prepare()
         CwLog.info("Графический мост открыт")
-        JREUtils.setLdLibraryPath("$jvmLib:$ld")
+        // Pojav opens the system EGL driver before the JVM, then the game renderer
+        // only after the window exists. gl4es reads the current folder in its constructor.
         prepareGraphics()
         openGraphics()
-        open(File(home, "lib/libjli.so").absolutePath, true)
+        val jli = File(home, "lib/libjli.so")
+        stopReexec(jli)
+        open(jli.absolutePath, true)
+        val jre = loadedJreHome(jli)
+        set("JAVA_HOME", jre)
+        args = args.map { if (it.startsWith("-Djava.home=")) "-Djava.home=$jre" else it }
+        val ld = javaLibraryPath(jre, nativeDir)
+        set("LD_LIBRARY_PATH", ld)
+        JREUtils.setLdLibraryPath(ld)
+        CwLog.info("Путь Java для запуска: $jre")
         openJvm(jvm, jvmLib)
+        openRuntimeLibs(jre, nativeDir)
         val gl4es = File(nativeDir, "libng_gl4es.so")
         if (!gl4es.isFile) throw IOException("Не открылась графическая библиотека libng_gl4es.so")
         open(File(nativeDir, "libopenal.so").absolutePath, false)
@@ -137,10 +137,14 @@ object PhoneVm {
         setupWindow(context, surface, width, height)
         patchOptions(width, height)
         enterGameDir()
+        if (!tryOpen(gl4es.absolutePath)) {
+            CwLog.warn("Графическая библиотека libng_gl4es.so не открылась до Java")
+        }
         write("pid", android.os.Process.myPid().toString())
         mark(Stage.RUNNING, 0, null)
         CwLog.info("Окно игры ${width}x${height}, Java внутри приложения")
         redirectJvmOutput()
+        set("LD_LIBRARY_PATH", ld)
         return VMLauncher.launchJVM(sized(width, height))
     }
 
@@ -291,11 +295,92 @@ object PhoneVm {
         return File("/system/lib64/libhoudini.so").isFile || File("/system/lib/libhoudini.so").isFile
     }
 
+    private fun stopReexec(jli: File) {
+        // CreateExecutionEnvironment at file offset 0x720c. The stock instruction
+        // jumps past execve only when LD_LIBRARY_PATH is empty. Always jump there.
+        val stock = byteArrayOf(0x60, 0x1e, 0x00, 0xb4.toByte())
+        val stay = byteArrayOf(0xf3.toByte(), 0x00, 0x00, 0x14)
+        try {
+            java.io.RandomAccessFile(jli, "rw").use { file ->
+                if (file.length() < 0x7210) {
+                    CwLog.warn("libjli.so короче ожидаемого")
+                    return
+                }
+                file.seek(0x720c)
+                val now = ByteArray(4)
+                file.readFully(now)
+                if (now.contentEquals(stay)) {
+                    CwLog.info("Повторный запуск Java уже отключён")
+                    return
+                }
+                if (!now.contentEquals(stock)) {
+                    CwLog.warn("Место проверки Java не совпало")
+                    return
+                }
+                file.seek(0x720c)
+                file.write(stay)
+            }
+            CwLog.info("Повторный запуск Java отключён")
+        } catch (e: Exception) {
+            CwLog.warn("Не удалось отключить повторный запуск Java: ${e.message}")
+        }
+    }
+
+    private fun loadedJreHome(opened: File): String {
+        val candidates = ArrayList<String>()
+        try {
+            candidates.add(opened.canonicalPath)
+        } catch (_: Exception) {
+        }
+        candidates.add(opened.absolutePath)
+        for (path in candidates) {
+            val cut = path.lastIndexOf("/lib/libjli.so")
+            if (cut > 0) return path.substring(0, cut)
+        }
+        return opened.parentFile?.parentFile?.absolutePath ?: opened.absolutePath
+    }
+
+    private fun javaLibraryPath(jre: String, nativeDir: String): String {
+        val root = jre.trimEnd('/')
+        val prefix = "$root/lib/server:$root/lib:$root/../lib"
+        val system = if (translatedPc()) {
+            listOf("/system/lib64/arm64", "/system/lib64/houdini/arm64", "/system/lib64")
+        } else {
+            listOf("/system/lib64")
+        }
+        return listOf(prefix, nativeDir)
+            .plus(system)
+            .plus(listOf("/vendor/lib64", "/vendor/lib64/hw"))
+            .joinToString(":")
+    }
+
     private fun set(key: String, value: String) {
         try {
             Os.setenv(key, value, true)
         } catch (e: ErrnoException) {
             CwLog.warn("Среда $key не записалась: ${e.message}")
+        }
+    }
+
+    private fun openRuntimeLibs(jre: String, nativeDir: String) {
+        // Same set Pojav's initJavaRuntime maps with dlopen, not ART System.load.
+        // The app freetype is opened first so the font library binds to it.
+        tryOpen(File(nativeDir, "libfreetype.so").absolutePath)
+        listOf(
+            "libverify.so",
+            "libjava.so",
+            "libnet.so",
+            "libnio.so",
+            "libawt.so",
+            "libawt_headless.so",
+            "libfontmanager.so"
+        ).forEach { name ->
+            val file = File(jre, "lib/$name")
+            if (!file.isFile) {
+                CwLog.warn("В Java нет $name")
+                return@forEach
+            }
+            if (!tryOpen(file.absolutePath)) CwLog.warn("Не открылась $name")
         }
     }
 
