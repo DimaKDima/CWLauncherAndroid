@@ -53,7 +53,7 @@ class Installer(
     private val cancel: AtomicBoolean,
     private val onProgress: (LoadProgress) -> Unit
 ) {
-    private val threads: Int get() = if (cfg.internetLeader) 4 else 3
+    private val threads: Int get() = if (cfg.internetLeader) 32 else 16
     private val meter = SpeedMeter()
     private val lastUi = AtomicLong(0)
     @Volatile private var lastDownloadError = ""
@@ -288,6 +288,7 @@ class Installer(
     }
 
     fun ensureRuntime(version: String, id: String) {
+        CwLog.info("Проверка библиотек перед запуском")
         if (id.startsWith("fabric-loader-")) {
             val loader = id.removePrefix("fabric-loader-").removeSuffix("-$version")
             if (loader.isBlank()) throw IOException(downloadError("Не указана версия Fabric", "fabric-loader"))
@@ -300,6 +301,8 @@ class Installer(
         val bad = profile.libraries.filter { it.download && !acceptLocal(File(AppPaths.libs(version), it.path), it) }
         if (bad.isNotEmpty()) {
             fetchAll(bad.map { it.item(version) }, "Загрузка библиотек", "")
+        } else {
+            CwLog.info("Библиотеки на месте")
         }
         if (profile.mainClass.contains("Knot") && !asmOnDisk(version, profile)) {
             throw IOException(downloadError("Fabric Loader не видит org/objectweb/asm/ClassReader", "org.ow2.asm:asm"))
@@ -412,13 +415,12 @@ class Installer(
         if (accepted == null) throw last ?: IOException("Не удалось проверить версию модов")
         step("Установка модов")
         val mods = AppPaths.mods(version)
-        mods.mkdirs()
-        val old = mods.listFiles()?.filter { it.isFile }.orEmpty()
-        val backup = File(AppPaths.tmp, "mods-backup-${System.currentTimeMillis()}")
-        if (old.isNotEmpty()) {
-            backup.mkdirs()
-            old.forEach { it.copyTo(File(backup, it.name), overwrite = true); it.delete() }
+        if (mods.exists()) {
+            mods.listFiles()?.forEach { child ->
+                if (!child.deleteRecursively()) CwLog.warn("Не удалось удалить старый мод: ${child.name}")
+            }
         }
+        mods.mkdirs()
         val moved = placePack(stage, AppPaths.game(version), mods)
         File(mods, "Version.txt").writeText(accepted)
         val state = JSONObject()
@@ -428,8 +430,7 @@ class Installer(
             .put("zipName", "modsCWL.zip")
         AppPaths.buildState(version).writeText(state.toString(2))
         writeManifest(version, mods)
-        if (old.isNotEmpty() && !cfg.modBackups) deleteTree(backup)
-        else pruneBackups()
+        pruneBackups()
         zip.delete()
         CwLog.info("Установлено файлов модов: $moved")
         step("Сборка модов установлена", 1f)
@@ -519,12 +520,14 @@ class Installer(
         val files = items.size
         fun sumDone() = fileDone.values.sum()
         reportBytes(title, 0, planned.coerceAtLeast(1), filesNote(extra, 0, files), true)
+        val logged = java.util.Collections.synchronizedSet(mutableSetOf<String>())
         var pending = items
         var round = 0
+        try {
         while (pending.isNotEmpty() && round < 5) {
             checkCancel()
             val failed = java.util.Collections.synchronizedList(mutableListOf<Item>())
-            val pool = java.util.concurrent.Executors.newFixedThreadPool(if (round == 0) threads else 1)
+            val pool = java.util.concurrent.Executors.newFixedThreadPool(minOf(threads, pending.size).coerceAtLeast(1))
             try {
                 val tasks = pending.map { item ->
                     pool.submit {
@@ -548,9 +551,10 @@ class Installer(
                         } catch (e: Throwable) {
                             if (cancel.get()) throw e
                             fileDone[key] = 0L
-                            lastDownloadError = e.message ?: e.javaClass.simpleName
+                            val msg = (e.message ?: e.javaClass.simpleName).trim()
+                            lastDownloadError = msg
                             failed.add(item)
-                            CwLog.warn("$title: ${item.label}: $lastDownloadError")
+                            if (logged.add(msg)) CwLog.warn("$title: ${item.label}: $msg")
                         }
                     }
                 }
@@ -580,6 +584,9 @@ class Installer(
         }
         val done = fileDone.values.sum().coerceAtLeast(planned)
         reportBytes(title, done, done.coerceAtLeast(1), filesNote(extra, files, files), true)
+        } finally {
+            net.releasePipes()
+        }
     }
 
     private fun verifyDownloaded(item: Item) {
@@ -611,7 +618,7 @@ class Installer(
         onProgress(LoadProgress(title, frac, done, total, speed, extra))
     }
 
-    private fun acceptLocal(file: File, lib: Lib): Boolean = fileLooksValid(file, lib, true)
+    private fun acceptLocal(file: File, lib: Lib): Boolean = fileLooksValid(file, lib, false)
 
     private fun fileLooksValid(file: File, lib: Lib, hash: Boolean): Boolean {
         if (!file.isFile || file.length() <= 0) return false
@@ -743,14 +750,20 @@ class Installer(
             }
             if (namedNative != null && !nativeClassifierAllowed(namedNative)) allow = false
             if (nativeKey != null && !nativeClassifierAllowed(nativeKey)) allow = false
+            val skipNative = name.contains("jemalloc", true) || name.contains("tinyfd", true)
             val out = mutableListOf<Lib>()
             val topSha = m.optString("sha1").ifBlank { null }
             val topSize = m.optLong("size", 0L)
             if (artifact != null || nativeKey == null) {
-                out.add(libOf(name, baseUrl, allow, namedNative, artifact, topSha, topSize))
+                out.add(withoutUnsafeNative(libOf(name, baseUrl, allow, namedNative, artifact, topSha, topSize), skipNative))
             }
-            if (nativeKey != null) out.add(libOf(name, baseUrl, allow, nativeKey, nat, null, 0))
+            if (nativeKey != null) out.add(withoutUnsafeNative(libOf(name, baseUrl, allow, nativeKey, nat, null, 0), skipNative))
             return out
+        }
+
+        private fun withoutUnsafeNative(lib: Lib, skipNative: Boolean): Lib {
+            if (!skipNative || lib.nativeClassifier.isNullOrBlank()) return lib
+            return lib.copy(download = false)
         }
 
         private fun libOf(

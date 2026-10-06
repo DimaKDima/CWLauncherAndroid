@@ -9,7 +9,7 @@ import java.util.zip.ZipInputStream
 
 object BundledJava {
     private const val ASSET = "jre17-arm64.zip"
-    private const val STAMP = "jre17-ec28559"
+    private const val STAMP = "jre17-17.0.20d"
     private const val ABI = "arm64-v8a"
 
     fun home(): File = File(AppPaths.root, "jre/17")
@@ -72,15 +72,135 @@ object BundledJava {
             CwLog.info("Встроенная Java 17 распакована в ${dir.absolutePath}")
         }
         linkExecutables(context, dir)
+        prepareLibraries(context, dir)
+        hidePackagedShmem(context)
         return dir
     }
 
     fun libraryPath(context: Context, home: File): String {
         return listOf(
             File(home, "lib/server").absolutePath,
-            File(home, "lib").absolutePath,
-            context.applicationInfo.nativeLibraryDir
+            File(home, "lib").absolutePath
         ).joinToString(":")
+    }
+
+    private fun prepareLibraries(context: Context, home: File) {
+        val marker = File(home, ".cw-libs")
+        val cxx = File(home, "lib/libc++_shared.so")
+        if (marker.isFile && marker.readText() == "4" && cxx.isFile && cxx.length() > 100_000) return
+        val oldName = "libandroid-shmem.so".toByteArray(Charsets.US_ASCII)
+        val newName = "libcwshmem-arm64.so".toByteArray(Charsets.US_ASCII)
+        check(oldName.size == newName.size)
+        home.walkTopDown().filter { it.isFile && it.name.endsWith(".so") }.forEach { file ->
+            val data = file.readBytes()
+            val replaced = replaceBytes(data, oldName, newName) ?: return@forEach
+            file.writeBytes(replaced)
+        }
+        for (rel in listOf("lib", "lib/server")) {
+            val dir = File(home, rel)
+            renameIfExists(File(dir, "libandroid-shmem.so"), File(dir, "libcwshmem-arm64.so"))
+            restoreZlib(dir)
+        }
+        cxx.parentFile?.mkdirs()
+        context.assets.open("libc++_shared.so").use { input ->
+            cxx.outputStream().use { input.copyTo(it) }
+        }
+        cxx.setExecutable(true, false)
+        copyAsset(context, "jre-extra/fontconfig.bfc", File(home, "lib/fontconfig.bfc"))
+        copyAsset(context, "jre-extra/fontconfig.properties", File(home, "lib/fontconfig.properties"))
+        val extraLibs = listOf(
+            "libjpeg.so.8",
+            "libspeexdsp.so",
+            "libpulse.so",
+            "libpulsecommon-17.0.so",
+            "libdbus-1.so",
+            "libandroid-execinfo.so",
+            "libsndfile.so",
+            "libFLAC.so",
+            "libogg.so",
+            "libopus.so",
+            "libvorbis.so",
+            "libvorbisenc.so",
+            "libmp3lame.so",
+            "libmpg123.so"
+        )
+        var libsReady = true
+        for (name in extraLibs) {
+            val out = File(home, "lib/$name")
+            copyAsset(context, "jre-extra/$name", out)
+            if (!out.isFile || out.length() < 1_000) {
+                libsReady = false
+                CwLog.warn("Не скопировалась библиотека $name")
+            } else {
+                out.setExecutable(true, false)
+            }
+        }
+        if (!libsReady) return
+        marker.writeText("4")
+        CwLog.info("Библиотеки Java подготовлены для переводчика ПК")
+    }
+
+    private fun hidePackagedShmem(context: Context) {
+        val leaked = File(context.applicationInfo.nativeLibraryDir, "libandroid-shmem.so")
+        if (leaked.isFile && !leaked.delete()) {
+            CwLog.warn("Системный каталог всё ещё содержит libandroid-shmem.so")
+        }
+    }
+
+    private fun restoreZlib(dir: File) {
+        val zlib = File(dir, "libz.so")
+        val renamed = File(dir, "libcwzlib.so")
+        if (!zlib.isFile && renamed.isFile) {
+            if (!renamed.renameTo(zlib)) renamed.copyTo(zlib, overwrite = true)
+        }
+        if (!zlib.isFile) return
+        val soname = File(dir, "libz.so.1")
+        if (!soname.isFile || soname.length() != zlib.length()) {
+            zlib.copyTo(soname, overwrite = true)
+            soname.setExecutable(true, false)
+        }
+    }
+
+    private fun copyAsset(context: Context, asset: String, out: File) {
+        out.parentFile?.mkdirs()
+        try {
+            context.assets.open(asset).use { input ->
+                out.outputStream().use { input.copyTo(it) }
+            }
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun renameIfExists(from: File, to: File) {
+        if (!from.isFile) return
+        if (to.exists() && !to.delete()) return
+        if (!from.renameTo(to)) {
+            from.copyTo(to, overwrite = true)
+            from.delete()
+        }
+    }
+
+    private fun replaceBytes(data: ByteArray, old: ByteArray, new: ByteArray): ByteArray? {
+        var changed = false
+        val out = data.copyOf()
+        var i = 0
+        while (i <= out.size - old.size) {
+            var same = true
+            for (j in old.indices) {
+                if (out[i + j] != old[j]) {
+                    same = false
+                    break
+                }
+            }
+            if (same) {
+                new.copyInto(out, i)
+                changed = true
+                i += old.size
+            } else {
+                i++
+            }
+        }
+        return if (changed) out else null
     }
 
     private fun linkExecutables(context: Context, dir: File) {

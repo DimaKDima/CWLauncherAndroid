@@ -1,6 +1,7 @@
 package ru.cw.launcher.ui
 
 import android.app.ActivityManager
+import ru.cw.launcher.engine.compareVersions
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
@@ -164,7 +165,14 @@ fun CwRoot(model: LauncherViewModel = viewModel()) {
             if (state.screen == Screen.VERSIONS) VersionPopup(state, model.engine)
         }
         state.dialog?.let { dialog ->
-            Notice(dialog.text, dialog.confirm, dialog.dismiss, { model.engine.confirmDialog() }, { model.engine.dismissDialog() })
+            Notice(
+                dialog.text,
+                dialog.confirm,
+                dialog.dismiss,
+                { model.engine.confirmDialog() },
+                { model.engine.dismissDialog() },
+                dialog.alt
+            ) { model.engine.altDialog() }
         }
         state.info?.let { text ->
             Notice(text, "Закрыть", null, { model.engine.dismissInfo() }, { model.engine.dismissInfo() })
@@ -309,7 +317,7 @@ private fun Home(state: UiState, engine: Engine, context: Context) {
                 }
                 Spacer(Modifier.height(6.dp))
                 val tone = statusTone(state.phase)
-                Text("●  ${readyCaption(state)}", color = tone, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                Text("●  ${readyCaption(state)}", color = tone, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
                 if (state.busy) {
                     Spacer(Modifier.height(4.dp))
                     if (state.xferTotal > 0L) {
@@ -329,39 +337,79 @@ private fun Home(state: UiState, engine: Engine, context: Context) {
                     Text(Lang.t("java_missing"), color = Amber, fontSize = 11.sp)
                 }
                 Spacer(Modifier.height(6.dp))
-                Button(
-                    onClick = { engine.onMain() },
-                    modifier = Modifier.fillMaxWidth().height(42.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(0.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = buttonColor(state.phase, state.busy), contentColor = Color.White)
-                ) {
-                    Row(verticalAlignment = Alignment.CenterVertically) {
-                        if (!state.busy && state.phase != Phase.RUNNING) Glyph("play", Color.White, Modifier.size(14.dp))
-                        Spacer(Modifier.width(8.dp))
-                        Text(buttonLabel(state.phase, state.busy, state.detail), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                if (state.phase == Phase.RUNNING || state.phase == Phase.STARTING) {
+                    Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                        Button(
+                            onClick = {},
+                            enabled = false,
+                            modifier = Modifier.weight(1f).height(42.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(0.dp),
+                            colors = ButtonDefaults.buttonColors(
+                                containerColor = BlueDeep,
+                                contentColor = Color.White,
+                                disabledContainerColor = BlueDeep,
+                                disabledContentColor = Color.White
+                            )
+                        ) {
+                            Text(
+                                if (state.phase == Phase.RUNNING) Lang.t("running") else Lang.t("starting"),
+                                fontSize = 16.sp,
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        Button(
+                            onClick = { engine.stopGame() },
+                            modifier = Modifier.weight(1f).height(42.dp),
+                            shape = RoundedCornerShape(10.dp),
+                            contentPadding = PaddingValues(0.dp),
+                            colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF3D4C63), contentColor = Color.White)
+                        ) {
+                            Text(Lang.t("close_game"), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
+                    }
+                } else {
+                    val locked = state.phase == Phase.STARTING
+                    Button(
+                        onClick = { engine.onMain() },
+                        enabled = !locked,
+                        modifier = Modifier.fillMaxWidth().height(42.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(0.dp),
+                        colors = ButtonDefaults.buttonColors(
+                            containerColor = buttonColor(state.phase, state.busy),
+                            contentColor = Color.White,
+                            disabledContainerColor = BlueDeep,
+                            disabledContentColor = Color.White
+                        )
+                    ) {
+                        Row(verticalAlignment = Alignment.CenterVertically) {
+                            if (!state.busy && !locked) Glyph("play", Color.White, Modifier.size(14.dp))
+                            if (!state.busy && !locked) Spacer(Modifier.width(8.dp))
+                            Text(buttonLabel(state.phase, state.busy, state.detail), fontSize = 16.sp, fontWeight = FontWeight.Bold)
+                        }
                     }
                 }
-                if (state.phase == Phase.RUNNING) {
-                    Spacer(Modifier.height(4.dp))
-                    GhostButton(Lang.t("close_game")) { engine.stopGame() }
+                if (!state.busy) {
+                    Spacer(Modifier.height(6.dp))
+                    GhostButton(Lang.t("version"), "chevron") { engine.open(Screen.VERSIONS) }
                 }
-                Spacer(Modifier.height(6.dp))
-                GhostButton(Lang.t("version"), "chevron") { engine.open(Screen.VERSIONS) }
                 Spacer(Modifier.weight(1f))
-                Button(
-                    onClick = { engine.open(Screen.SETTINGS) },
-                    modifier = Modifier.width(180.dp).height(36.dp),
-                    shape = RoundedCornerShape(10.dp),
-                    contentPadding = PaddingValues(0.dp),
-                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1A2C4A), contentColor = TextMain)
-                ) {
-                    Glyph("gear", TextMain, Modifier.size(14.dp))
-                    Spacer(Modifier.width(6.dp))
-                    Text(Lang.t("settings"), fontSize = 13.sp)
+                if (!state.busy) {
+                    Button(
+                        onClick = { engine.open(Screen.SETTINGS) },
+                        modifier = Modifier.width(180.dp).height(36.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(0.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1A2C4A), contentColor = TextMain)
+                    ) {
+                        Glyph("gear", TextMain, Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(Lang.t("settings"), fontSize = 13.sp)
+                    }
                 }
                 val remote = state.launcherRemote
-                if (remote != null && remote != CwLog.VERSION) {
+                if (remote != null && compareVersions(remote, CwLog.VERSION) > 0) {
                     TextButton(onClick = { engine.downloadLauncher() }) {
                         Text("Обновить лаунчер $remote", color = Amber, fontSize = 11.sp)
                     }
@@ -401,16 +449,47 @@ private fun Home(state: UiState, engine: Engine, context: Context) {
                 ActionTile("box", Lang.t("mods")) { engine.open(Screen.MODS) }
                 ActionTile("skin", Lang.t("skin")) { engine.open(Screen.SKIN) }
             }
-            Button(
-                onClick = { openLink(context, engine.cfg.supportUrl) },
-                modifier = Modifier.align(Alignment.Center).height(34.dp),
-                shape = RoundedCornerShape(10.dp),
-                contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
-                colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1A2C4A), contentColor = TextMain)
-            ) {
-                Glyph("info", TextMain, Modifier.size(14.dp))
-                Spacer(Modifier.width(6.dp))
-                Text(Lang.t("support"), fontSize = 12.sp)
+            if (state.busy) {
+                Row(
+                    Modifier.align(Alignment.Center),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Button(
+                        onClick = { engine.open(Screen.SETTINGS) },
+                        modifier = Modifier.width(168.dp).height(36.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(0.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1A2C4A), contentColor = TextMain)
+                    ) {
+                        Glyph("gear", TextMain, Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(Lang.t("settings"), fontSize = 13.sp)
+                    }
+                    Button(
+                        onClick = { openLink(context, engine.cfg.supportUrl) },
+                        modifier = Modifier.width(168.dp).height(36.dp),
+                        shape = RoundedCornerShape(10.dp),
+                        contentPadding = PaddingValues(0.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1A2C4A), contentColor = TextMain)
+                    ) {
+                        Glyph("info", TextMain, Modifier.size(14.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text(Lang.t("support"), fontSize = 12.sp, maxLines = 1)
+                    }
+                }
+            } else {
+                Button(
+                    onClick = { openLink(context, engine.cfg.supportUrl) },
+                    modifier = Modifier.align(Alignment.Center).height(34.dp),
+                    shape = RoundedCornerShape(10.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 0.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color(0xCC1A2C4A), contentColor = TextMain)
+                ) {
+                    Glyph("info", TextMain, Modifier.size(14.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text(Lang.t("support"), fontSize = 12.sp)
+                }
             }
         }
         Row(Modifier.fillMaxWidth().padding(top = 2.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -1540,7 +1619,15 @@ private fun Field(label: String, value: String, enabled: Boolean = true, onChang
 }
 
 @Composable
-private fun Notice(text: String, confirm: String, dismiss: String?, onConfirm: () -> Unit, onDismiss: () -> Unit) {
+private fun Notice(
+    text: String,
+    confirm: String,
+    dismiss: String?,
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit,
+    alt: String? = null,
+    onAlt: () -> Unit = {}
+) {
     Box(Modifier.fillMaxSize().background(Color(0xAA06101C)).clickable { onDismiss() }, contentAlignment = Alignment.Center) {
         Column(
             Modifier
@@ -1557,11 +1644,15 @@ private fun Notice(text: String, confirm: String, dismiss: String?, onConfirm: (
             Text(text, color = TextMain, fontSize = 14.sp)
             Spacer(Modifier.height(12.dp))
             Row(horizontalArrangement = Arrangement.End, modifier = Modifier.fillMaxWidth()) {
-                if (dismiss != null) {
-                    TextButton(onClick = onDismiss) { Text(dismiss, color = Muted) }
+                TextButton(onClick = onConfirm) { Text(confirm, color = if (alt != null) Color(0xFFE0524D) else Blue) }
+                if (alt != null) {
                     Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = onAlt) { Text(alt, color = Blue) }
                 }
-                TextButton(onClick = onConfirm) { Text(confirm, color = Blue) }
+                if (dismiss != null) {
+                    Spacer(Modifier.width(8.dp))
+                    TextButton(onClick = onDismiss) { Text(dismiss, color = Muted) }
+                }
             }
         }
     }
@@ -1970,7 +2061,7 @@ private fun readyCaption(state: UiState): String = when (state.phase) {
     Phase.UPDATE_AVAILABLE -> state.detail
     Phase.ERROR -> state.detail
     Phase.RUNNING -> Lang.t("running")
-    Phase.STARTING -> Lang.t("starting")
+    Phase.STARTING -> state.detail.ifBlank { Lang.t("starting") }
     else -> state.detail.ifBlank { Lang.t("checking") }
 }
 

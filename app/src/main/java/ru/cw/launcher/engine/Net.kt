@@ -1,14 +1,23 @@
 package ru.cw.launcher.engine
 
+import org.json.JSONObject
 import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
+import java.net.Socket
 import java.net.URL
 import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
+import javax.net.ssl.SNIHostName
+import javax.net.ssl.SSLSocket
+import javax.net.ssl.SSLSocketFactory
 
 class Net {
     private val deadHosts = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val dohAddress = java.util.concurrent.ConcurrentHashMap<String, String>()
+    private val dohNoted = java.util.Collections.synchronizedSet(mutableSetOf<String>())
+    private val openPipes = java.util.Collections.synchronizedSet(mutableSetOf<SSLSocket>())
+    private val pipeLocal = ThreadLocal<Pipe?>()
 
     fun getStatus(url: String): Pair<Int, String> = request(url, "GET", null, emptyMap())
 
@@ -25,11 +34,24 @@ class Net {
                     if (code in 200..299 && body.isNotBlank()) return body
                     throw IOException("HTTP $code ${shorten(candidate)}")
                 } catch (e: Exception) {
-                    last = e
-                    if (connectFailed(e)) {
-                        deadHosts.add(hostOf(candidate))
+                    val previous = last
+                    last = if (previous == null || !dnsFailed(e) || dnsFailed(previous)) e else previous
+                    if (dnsFailed(e)) {
+                        val ip = resolveDoh(hostOf(candidate))
+                        if (!ip.isNullOrBlank()) {
+                            try {
+                                noteDns(candidate, ip)
+                                val body = textDirect(candidate, ip)
+                                if (body.isNotBlank()) return body
+                            } catch (e2: Exception) {
+                                val previous = last
+                                last = if (previous == null || !dnsFailed(e2) || dnsFailed(previous)) e2 else previous
+                            }
+                        }
+                        markDead(candidate)
                         break
                     }
+                    if (connectFailed(e)) break
                     attempt++
                     if (attempt < 2) Thread.sleep(600)
                 }
@@ -58,6 +80,19 @@ class Net {
         dest.parentFile?.mkdirs()
         var last: Exception? = null
         for (candidate in routes(url)) {
+            if (hostOf(candidate) in deadHosts) {
+                val known = dohAddress[hostOf(candidate)] ?: resolveDoh(hostOf(candidate))
+                if (!known.isNullOrBlank()) {
+                    try {
+                        transferDirect(candidate, known, dest, sha1, size, startOf(dest), cancel, onProgress)
+                        return
+                    } catch (e: Exception) {
+                        if (cancel?.get() == true) throw e
+                        last = e
+                        dropPipe()
+                    }
+                }
+            }
             var attempt = 0
             while (attempt < 4) {
                 if (cancel?.get() == true) throw IOException("Отменено")
@@ -66,12 +101,30 @@ class Net {
                     return
                 } catch (e: Exception) {
                     if (cancel?.get() == true) throw e
-                    last = e
-                    val reset = isReset(e)
-                    if (connectFailed(e) && !reset) {
-                        val host = hostOf(candidate)
-                        if (deadHosts.add(host)) {
-                            CwLog.warn("Сервер $host недоступен, дальше используется зеркало")
+                    val previous = last
+                    last = if (previous == null || !dnsFailed(e) || dnsFailed(previous)) e else previous
+                    if (dnsFailed(e)) {
+                        markDead(candidate)
+                        val ip = resolveDoh(hostOf(candidate))
+                        if (!ip.isNullOrBlank()) {
+                            try {
+                                noteDns(candidate, ip)
+                                transferDirect(candidate, ip, dest, sha1, size, startOf(dest), cancel, onProgress)
+                                return
+                            } catch (e2: Exception) {
+                                if (cancel?.get() == true) throw e2
+                                val previous = last
+                                last = if (previous == null || !dnsFailed(e2) || dnsFailed(previous)) e2 else previous
+                            }
+                        }
+                        markDead(candidate)
+                        break
+                    }
+                    if (connectFailed(e) || isReset(e)) {
+                        attempt++
+                        if (attempt < 2) {
+                            Thread.sleep(400L * attempt)
+                            continue
                         }
                         break
                     }
@@ -120,6 +173,10 @@ class Net {
         } finally {
             connection.disconnect()
         }
+        commitDownload(part, dest, sha1, size)
+    }
+
+    private fun commitDownload(part: File, dest: File, sha1: String?, size: Long) {
         if (size > 0 && part.length() != size) {
             part.delete()
             throw IOException("Размер не совпал: ${dest.name}")
@@ -136,20 +193,66 @@ class Net {
     }
 
     private fun routes(url: String): List<String> {
-        val rewritten = rewriteHost(url)
+        val alts = alternatives(rewriteHost(url))
         val out = LinkedHashSet<String>()
-        if (hostOf(rewritten) !in deadHosts) out.add(rewritten)
-        mirrorOf(rewritten)?.let { if (hostOf(it) !in deadHosts) out.add(it) }
-        centralOf(rewritten)?.let { if (hostOf(it) !in deadHosts) out.add(it) }
-        mcimOf(rewritten)?.let { if (hostOf(it) !in deadHosts) out.add(it) }
-        if (out.isEmpty()) out.add(rewritten)
+        for (candidate in alts) {
+            if (hostOf(candidate) !in deadHosts) out.add(candidate)
+        }
+        if (out.isEmpty()) {
+            alts.filter { hostOf(it) != "resources.download.minecraft.net" }.forEach { out.add(it) }
+        }
+        if (out.isEmpty() && alts.isNotEmpty()) out.add(alts.first())
         return out.toList()
+    }
+
+    private fun alternatives(url: String): List<String> {
+        val out = LinkedHashSet<String>()
+        val assets = assetObjectPath(url)
+        if (assets != null) {
+            out.add("https://resources.download.minecraft.net/$assets")
+            out.add("https://bmclapi2.bangbang93.com/assets/$assets")
+            return out.toList()
+        }
+        val host = hostOf(url)
+        val officialLast = host == "resources.download.minecraft.net" || host in deadHosts
+        if (!officialLast) out.add(url)
+        mirrorOf(url)?.let { out.add(it) }
+        centralOf(url)?.let { out.add(it) }
+        mcimOf(url)?.let { out.add(it) }
+        if (officialLast) out.add(url)
+        if (out.isEmpty()) out.add(url)
+        return out.toList()
+    }
+
+    private fun assetObjectPath(url: String): String? {
+        val markers = listOf(
+            "://resources.download.minecraft.net/",
+            "://resources.fastmcmirror.org/",
+            "://bmclapi2.bangbang93.com/assets/",
+            "://resources.download.mcimirror.top/"
+        )
+        for (marker in markers) {
+            val at = url.indexOf(marker)
+            if (at < 0) continue
+            val path = url.substring(at + marker.length)
+            if (path.length > 5 && path[2] == '/') return path
+        }
+        return null
+    }
+
+    private fun markDead(url: String) {
+        val host = hostOf(url)
+        if (host.isNotBlank() && deadHosts.add(host)) {
+            CwLog.warn("Сервер $host недоступен, дальше используется зеркало")
+        }
     }
 
     private fun rewriteHost(url: String): String {
         val host = hostOf(url)
-        if (host != "bmclapi1.sakura.sld.tw" && host != "bmclapi.bangbang93.com") return url
-        return url.replace("://$host", "://bmclapi2.bangbang93.com")
+        if (host.contains("sakura.sld.tw") || host == "bmclapi.bangbang93.com") {
+            return url.replace("://$host", "://bmclapi2.bangbang93.com")
+        }
+        return url
     }
 
     private fun mirrorOf(url: String): String? {
@@ -201,27 +304,18 @@ class Net {
         val seen = HashSet<String>()
         repeat(5) {
             if (!seen.add(current)) return@repeat
-            val connection = connect(current, "GET")
-            headers.forEach { (k, v) -> connection.setRequestProperty(k, v) }
-            val code = try {
-                connection.responseCode
+            val connection = try {
+                handshake(current, "GET", headers)
             } catch (e: Exception) {
-                connection.disconnect()
                 throw e
             }
+            val code = connection.responseCode
             if (code !in 300..399) return connection
             val location = connection.getHeaderField("Location")
             connection.disconnect()
             if (location.isNullOrBlank()) throw IOException("Пустая переадресация ${shorten(current)}")
             val next = absolute(current, location)
-            val rewritten = rewriteHost(next)
-            val jumped = if (hostOf(rewritten) == hostOf(current) || hostOf(next) == "bmclapi1.sakura.sld.tw") {
-                mcimOf(current) ?: mcimOf(rewritten) ?: rewritten
-            } else {
-                rewritten
-            }
-            CwLog.warn("Переадресация ${shorten(current)} → ${shorten(jumped)}")
-            current = jumped
+            current = rewriteHost(next)
         }
         throw IOException("Слишком много переадресаций ${shorten(url)}")
     }
@@ -240,6 +334,19 @@ class Net {
     private fun isReset(e: Exception): Boolean {
         val text = (e.message ?: "").lowercase(Locale.ROOT)
         return text.contains("connection reset") || text.contains("connection abort") || text.contains("broken pipe")
+    }
+
+    private fun dnsFailed(e: Exception): Boolean {
+        var current: Throwable? = e
+        while (current != null) {
+            if (current is java.net.UnknownHostException) return true
+            val text = (current.message ?: "").lowercase(Locale.ROOT)
+            if (text.contains("unable to resolve") || text.contains("no address associated")
+                || text.contains("unknownhost") || text.contains("nodename nor servname")
+            ) return true
+            current = current.cause
+        }
+        return false
     }
 
     private fun connectFailed(e: Exception): Boolean {
@@ -268,13 +375,13 @@ class Net {
                 connection.disconnect()
             }
         }
-        val connection = connect(url, method)
-        headers.forEach { (k, v) -> connection.setRequestProperty(k, v) }
-        if (json != null) {
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "application/json; charset=utf-8")
-            connection.setRequestProperty("Accept", "application/json")
-            connection.outputStream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+        val connection = handshake(url, method, headers) { outgoing ->
+            if (json != null) {
+                outgoing.doOutput = true
+                outgoing.setRequestProperty("Content-Type", "application/json; charset=utf-8")
+                outgoing.setRequestProperty("Accept", "application/json")
+                outgoing.outputStream.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+            }
         }
         return try {
             val code = connection.responseCode
@@ -286,8 +393,202 @@ class Net {
         }
     }
 
-    private fun connect(url: String, method: String): HttpURLConnection {
+    private fun handshake(
+        url: String,
+        method: String,
+        headers: Map<String, String>,
+        prepare: (HttpURLConnection) -> Unit = {}
+    ): HttpURLConnection {
+        fun boot(connection: HttpURLConnection): HttpURLConnection {
+            headers.forEach { (k, v) -> connection.setRequestProperty(k, v) }
+            prepare(connection)
+            connection.responseCode
+            return connection
+        }
+        val first = plain(url, method)
+        return try {
+            boot(first)
+        } catch (e: Exception) {
+            first.disconnect()
+            throw e
+        }
+    }
+
+    private fun plain(url: String, method: String): HttpURLConnection {
         val connection = URL(url).openConnection() as HttpURLConnection
+        prepare(connection, method)
+        return connection
+    }
+
+    private fun noteDns(url: String, ip: String) {
+        val host = hostOf(url)
+        if (host.isNotBlank() && dohNoted.add(host)) CwLog.info("Адрес $host получен через DNS: $ip")
+    }
+
+    private fun startOf(dest: File): Long {
+        val part = File(dest.parentFile, dest.name + ".part")
+        return if (part.isFile) part.length() else 0L
+    }
+
+    private fun textDirect(url: String, ip: String): String {
+        AppPaths.tmp.mkdirs()
+        val tmp = File.createTempFile("cw-dns", ".txt", AppPaths.tmp)
+        return try {
+            transferDirect(url, ip, tmp, null, 0, 0, null, null)
+            tmp.readText()
+        } finally {
+            tmp.delete()
+        }
+    }
+
+    private fun transferDirect(
+        url: String,
+        ip: String,
+        dest: File,
+        sha1: String?,
+        size: Long,
+        resume: Long,
+        cancel: AtomicBoolean?,
+        onProgress: ((Long, Long) -> Unit)?
+    ) {
+        dest.parentFile?.mkdirs()
+        val part = File(dest.parentFile, dest.name + ".part")
+        var start = resume
+        if (size > 0 && start >= size) start = 0L
+        var currentUrl = url
+        var currentIp = ip
+        repeat(5) {
+            if (cancel?.get() == true) throw IOException("Отменено")
+            val src = URL(currentUrl)
+            val path = src.file.ifBlank { "/" }
+            val pipe = borrowPipe(src.host, currentIp)
+            var reuse = false
+            try {
+                val range = if (start > 0) "Range: bytes=$start-\r\n" else ""
+                val request = "GET $path HTTP/1.1\r\nHost: ${src.host}\r\nUser-Agent: CWLauncher/${CwLog.VERSION}\r\nAccept: */*\r\nAccept-Encoding: identity\r\nConnection: keep-alive\r\n$range\r\n"
+                pipe.socket.outputStream.write(request.toByteArray(Charsets.ISO_8859_1))
+                pipe.socket.outputStream.flush()
+                val input = pipe.input
+                val status = socketLine(input)
+                val code = status.split(" ").getOrNull(1)?.toIntOrNull() ?: throw IOException("Плохой ответ ${shorten(currentUrl)}")
+                val responseHeaders = linkedMapOf<String, String>()
+                while (true) {
+                    val line = socketLine(input)
+                    if (line.isEmpty()) break
+                    val colon = line.indexOf(':')
+                    if (colon > 0) responseHeaders[line.substring(0, colon).trim().lowercase(Locale.ROOT)] = line.substring(colon + 1).trim()
+                }
+                if (code in 300..399) {
+                    discardBody(input, responseHeaders)
+                    val location = responseHeaders["location"] ?: throw IOException("Пустая переадресация ${shorten(currentUrl)}")
+                    currentUrl = absolute(currentUrl, location)
+                    val nextHost = hostOf(currentUrl)
+                    if (nextHost != src.host) dropPipe()
+                    currentIp = dohAddress[nextHost] ?: resolveDoh(nextHost) ?: throw IOException("Не удалось открыть ${shorten(currentUrl)}")
+                    reuse = nextHost == src.host && responseHeaders["connection"]?.contains("close", true) != true
+                    return@repeat
+                }
+                if (code !in 200..299) {
+                    discardBody(input, responseHeaders)
+                    throw IOException("HTTP $code ${shorten(currentUrl)}")
+                }
+                val append = code == 206 && start > 0
+                if (code == 200) start = 0L
+                val length = responseHeaders["content-length"]?.toLongOrNull() ?: -1L
+                val total = if (size > 0) size else if (length >= 0) start + length else 0L
+                java.io.FileOutputStream(part, append).use { output ->
+                    val buf = ByteArray(256 * 1024)
+                    var done = if (append) start else 0L
+                    var left = if (length >= 0) length else Long.MAX_VALUE
+                    while (left > 0) {
+                        if (cancel?.get() == true) throw IOException("Отменено")
+                        val want = minOf(buf.size.toLong(), left).toInt()
+                        val n = input.read(buf, 0, want)
+                        if (n < 0) break
+                        output.write(buf, 0, n)
+                        done += n
+                        left -= n
+                        if (total > 0) onProgress?.invoke(done, total)
+                    }
+                }
+                reuse = length >= 0 && responseHeaders["connection"]?.contains("close", true) != true
+                commitDownload(part, dest, sha1, size)
+                return
+            } catch (e: Exception) {
+                dropPipe()
+                reuse = false
+                throw e
+            } finally {
+                if (!reuse) dropPipe()
+            }
+        }
+        throw IOException("Слишком много переадресаций ${shorten(url)}")
+    }
+
+    private class Pipe(val host: String, val ip: String, val socket: SSLSocket, val input: java.io.BufferedInputStream)
+
+    private fun borrowPipe(host: String, ip: String): Pipe {
+        val current = pipeLocal.get()
+        if (current != null && current.host == host && current.ip == ip && current.socket.isConnected && !current.socket.isClosed) {
+            return current
+        }
+        if (current != null) dropPipe()
+        val socket = openTls(host, ip)
+        openPipes.add(socket)
+        val created = Pipe(host, ip, socket, java.io.BufferedInputStream(socket.inputStream, 256 * 1024))
+        pipeLocal.set(created)
+        return created
+    }
+
+    private fun dropPipe() {
+        val current = pipeLocal.get() ?: return
+        pipeLocal.remove()
+        openPipes.remove(current.socket)
+        try {
+            current.socket.close()
+        } catch (_: Exception) {
+        }
+    }
+
+    private fun discardBody(input: java.io.InputStream, headers: Map<String, String>) {
+        val length = headers["content-length"]?.toLongOrNull() ?: -1L
+        if (length < 0) {
+            dropPipe()
+            return
+        }
+        var left = length
+        val buf = ByteArray(8192)
+        while (left > 0) {
+            val n = input.read(buf, 0, minOf(buf.size.toLong(), left).toInt())
+            if (n < 0) break
+            left -= n
+        }
+    }
+
+    private fun openTls(host: String, ip: String): SSLSocket {
+        val tcp = Socket()
+        tcp.connect(java.net.InetSocketAddress(ip, 443), 12_000)
+        tcp.soTimeout = 120_000
+        val ssl = SSLContextHolder.factory.createSocket(tcp, host, 443, true) as SSLSocket
+        val params = ssl.sslParameters
+        params.serverNames = listOf(SNIHostName(host))
+        params.endpointIdentificationAlgorithm = "HTTPS"
+        ssl.sslParameters = params
+        ssl.startHandshake()
+        return ssl
+    }
+
+    private fun socketLine(input: java.io.InputStream): String {
+        val out = StringBuilder()
+        while (true) {
+            val b = input.read()
+            if (b < 0 || b == '\n'.code) break
+            if (b != '\r'.code) out.append(b.toChar())
+        }
+        return out.toString()
+    }
+
+    private fun prepare(connection: HttpURLConnection, method: String) {
         connection.instanceFollowRedirects = false
         connection.connectTimeout = 12_000
         connection.readTimeout = 120_000
@@ -295,8 +596,60 @@ class Net {
         connection.setRequestProperty("User-Agent", "CWLauncher/${CwLog.VERSION}")
         connection.setRequestProperty("Accept", "*/*")
         connection.setRequestProperty("Accept-Encoding", "identity")
-        connection.setRequestProperty("Connection", "close")
-        return connection
+    }
+
+    fun releasePipes() {
+        pipeLocal.remove()
+        val copy = openPipes.toList()
+        openPipes.clear()
+        copy.forEach { socket ->
+            try {
+                socket.close()
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    private fun looksLikeIp(host: String): Boolean {
+        return host.all { it.isDigit() || it == '.' }
+    }
+
+    private fun resolveDoh(host: String): String? {
+        dohAddress[host]?.let { return it }
+        val endpoints = listOf(
+            "https://1.1.1.1/dns-query?name=$host&type=A",
+            "https://8.8.8.8/resolve?name=$host&type=A"
+        )
+        for (endpoint in endpoints) {
+            try {
+                val body = rawText(endpoint)
+                val answers = JSONObject(body).optJSONArray("Answer") ?: continue
+                for (i in 0 until answers.length()) {
+                    val item = answers.optJSONObject(i) ?: continue
+                    if (item.optInt("type") != 1) continue
+                    val ip = item.optString("data").trim().trimEnd('.')
+                    if (ip.isBlank() || !looksLikeIp(ip)) continue
+                    dohAddress[host] = ip
+                    return ip
+                }
+            } catch (e: Exception) {
+                CwLog.warn("DNS $host: ${e.message}")
+            }
+        }
+        return null
+    }
+
+    private fun rawText(url: String): String {
+        val connection = URL(url).openConnection() as HttpURLConnection
+        connection.connectTimeout = 8_000
+        connection.readTimeout = 12_000
+        connection.setRequestProperty("Accept", "application/dns-json")
+        connection.setRequestProperty("User-Agent", "CWLauncher/${CwLog.VERSION}")
+        return connection.inputStream.use { it.bufferedReader().readText() }.also { connection.disconnect() }
+    }
+
+    private object SSLContextHolder {
+        val factory: SSLSocketFactory = javax.net.ssl.SSLContext.getDefault().socketFactory
     }
 }
 

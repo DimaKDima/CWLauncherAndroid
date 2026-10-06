@@ -43,6 +43,17 @@
             </intent-filter>
         </activity>
 
+        <activity
+            android:name=".ui.GameActivity"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|density"
+            android:exported="false"
+            android:hardwareAccelerated="true"
+            android:launchMode="singleTask"
+            android:process=":game"
+            android:screenOrientation="sensorLandscape"
+            android:theme="@style/Theme.CWLauncher"
+            android:windowSoftInputMode="adjustNothing" />
+
         <service
             android:name=".work.WorkService"
             android:exported="false"

@@ -23,7 +23,14 @@ enum class Phase {
 
 enum class Screen { HOME, SETTINGS, ACCOUNT, VERSIONS, NEWS, UPDATES, FILES, MODS, SKIN, LOG }
 
-data class DialogModel(val text: String, val confirm: String, val dismiss: String?, val action: String)
+data class DialogModel(
+    val text: String,
+    val confirm: String,
+    val dismiss: String?,
+    val action: String,
+    val alt: String? = null,
+    val altAction: String? = null
+)
 
 data class UiState(
     val booting: Boolean = true,
@@ -72,6 +79,7 @@ class Engine(private val app: Context) {
     val accounts: Accounts
     val ely: ElyLogin
     private val cancel = AtomicBoolean(false)
+    @Volatile private var deletePartialOnCancel = false
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
     private val installer: Installer
     private val game: GameLaunch
@@ -160,6 +168,15 @@ class Engine(private val app: Context) {
         _state.update { it.copy(screen = screen) }
     }
 
+    fun altDialog() {
+        val action = _state.value.dialog?.altAction
+        _state.update { it.copy(dialog = null) }
+        if (action == "cancel-keep") {
+            deletePartialOnCancel = false
+            cancel.set(true)
+        }
+    }
+
     fun dismissDialog() = _state.update { it.copy(dialog = null) }
     fun dismissInfo() = _state.update { it.copy(info = null) }
 
@@ -168,6 +185,14 @@ class Engine(private val app: Context) {
         _state.update { it.copy(dialog = null) }
         when (action) {
             "cancel" -> cancel.set(true)
+            "cancel-delete" -> {
+                deletePartialOnCancel = true
+                cancel.set(true)
+            }
+            "cancel-keep" -> {
+                deletePartialOnCancel = false
+                cancel.set(true)
+            }
             "install" -> install(false)
             "repair" -> install(false)
             "account" -> open(Screen.ACCOUNT)
@@ -179,8 +204,12 @@ class Engine(private val app: Context) {
         if (_state.value.busy || phase == Phase.CHECKING || phase == Phase.INSTALLING || phase == Phase.DOWNLOADING || phase == Phase.UPDATING) {
             _state.update {
                 it.copy(dialog = DialogModel(
-                    "Отменить текущую операцию? Незавершённый файл будет удалён.",
-                    "Отменить", "Продолжить", "cancel"
+                    "Остановить загрузку? Скачанное можно оставить и продолжить позже или удалить файлы.",
+                    "Удалить файлы",
+                    "Продолжить",
+                    "cancel-delete",
+                    "Остановить",
+                    "cancel-keep"
                 ))
             }
             return
@@ -517,39 +546,24 @@ class Engine(private val app: Context) {
     }
 
     private fun fetchBuildVersion(readZip: Boolean) {
-        var fromZip: String? = null
-        if (readZip && cfg.commonWorldMods()) {
-            val cached = java.io.File(AppPaths.cache, "modsCWL.zip")
-            if (cached.isFile) fromZip = Installer.readModsVersionZip(cached)
-            if (fromZip == null) {
-                try {
-                    fromZip = installer.readRemoteModsVersion()
-                } catch (e: Exception) {
-                    CwLog.warn("modsCWL.zip: ${e.message}")
-                }
-            }
+        if (!cfg.commonWorldMods()) return
+        val local = installer.installedBuild(cfg.minecraftVersion)
+        if (local.isNullOrBlank()) {
+            cfg.remoteBuildVersion = null
+            CwLog.info("Папка модов пустая, сверка версии пропущена")
+            return
         }
-        var fromFile: String? = null
-        try {
-            fromFile = readVersionToken(readRemoteText(net, cfg.cwVersionUrl))
+        val remote = try {
+            readVersionToken(readRemoteText(net, cfg.cwVersionUrl))
         } catch (e: Exception) {
             CwLog.warn("cwVersion.txt: ${e.message}")
+            null
         }
-        cfg.remoteBuildVersion = fromZip ?: fromFile
-        if (cfg.remoteBuildVersion != null) CwLog.info("Версия модов ${cfg.remoteBuildVersion}")
-        if (readZip && cfg.commonWorldMods() && fromZip != null) {
-            scope.launch {
-                try {
-                    val fresh = installer.readRemoteModsVersion()
-                    if (!fresh.isNullOrBlank() && fresh != cfg.remoteBuildVersion) {
-                        cfg.remoteBuildVersion = fresh
-                        CwLog.info("modsCWL.zip = $fresh")
-                        evaluate()
-                    }
-                } catch (e: Exception) {
-                    CwLog.warn("modsCWL.zip: ${e.message}")
-                }
-            }
+        cfg.remoteBuildVersion = remote
+        if (remote == null) CwLog.info("Версия модов в папке $local, cwVersion.txt недоступен")
+        else CwLog.info("Версия модов в папке $local, cwVersion.txt = $remote")
+        if (readZip && remote != null && compareVersions(local, remote) < 0) {
+            CwLog.info("На диске версия модов новее: $local → $remote")
         }
     }
 
@@ -587,8 +601,13 @@ class Engine(private val app: Context) {
         val phase: Phase
         val detail: String
         if (game.running()) {
-            phase = Phase.RUNNING
-            detail = "Minecraft запущен"
+            if (game.booted) {
+                phase = Phase.RUNNING
+                detail = "Minecraft запущен"
+            } else {
+                phase = Phase.STARTING
+                detail = "Minecraft запускается"
+            }
         } else if (!jar) {
             phase = Phase.NOT_INSTALLED
             detail = "Minecraft $version не установлен"
@@ -742,15 +761,61 @@ class Engine(private val app: Context) {
                 setPhase(Phase.STARTING, "Minecraft запускается")
                 WorkService.show(app, "Minecraft запускается")
                 game.start(account, profileId)
-                setPhase(Phase.RUNNING, "Minecraft запущен")
                 endBusy()
-                val process = game.process
-                val code = process?.waitFor() ?: -1
+                CwLog.info("Окно игры открывается на телефоне")
+                val cursors = mutableMapOf<String, Long>()
+                game.outputLogs().forEach { file ->
+                    if (file.isFile) cursors[file.absolutePath] = file.length()
+                }
+                var lastLine = "Окно игры открывается на телефоне"
+                var lastBeat = System.currentTimeMillis()
+                val openedAt = System.currentTimeMillis()
+                var diedEarly = false
+                _state.update { it.copy(detail = lastLine, progressText = lastLine) }
+                while (true) {
+                    val stage = PhoneVm.stage()
+                    val beat = PhoneVm.beat()
+                    val stale = beat > 0 && System.currentTimeMillis() - beat > 12_000
+                    if (stage == PhoneVm.Stage.EXITED) break
+                    if (stage == PhoneVm.Stage.RUNNING && stale) break
+                    if (stage == PhoneVm.Stage.STARTING && stale && System.currentTimeMillis() - openedAt > 15_000) {
+                        diedEarly = true
+                        break
+                    }
+                    if (stage == PhoneVm.Stage.IDLE) break
+                    val lines = game.freshGameLines(cursors)
+                    for (line in lines) {
+                        val short = line.take(220)
+                        CwLog.info("Игра: $short")
+                        lastLine = short
+                        lastBeat = System.currentTimeMillis()
+                    }
+                    if (lines.isNotEmpty()) {
+                        _state.update { it.copy(detail = lastLine, progressText = lastLine) }
+                    } else if (System.currentTimeMillis() - lastBeat > 5000) {
+                        lastBeat = System.currentTimeMillis()
+                        CwLog.info(lastLine)
+                    }
+                    if (game.windowReady() && _state.value.phase != Phase.RUNNING) {
+                        _state.update { it.copy(phase = Phase.RUNNING, detail = "Minecraft запущен", progressText = "Minecraft запущен") }
+                        CwLog.info("Окно Minecraft создано")
+                    }
+                    delay(400)
+                }
+                val code = PhoneVm.storedCode()
+                val storedError = PhoneVm.storedError()
                 CwLog.info("Игра завершилась с кодом $code")
-                if (code != 0) {
-                    val tail = if (AppPaths.gameLog.isFile) AppPaths.gameLog.readText().takeLast(8_000) else ""
+                val showed = game.booted
+                game.booted = false
+                if (game.stoppedByUser || storedError == "stop") {
+                    evaluate()
+                } else if (diedEarly || storedError.isNotBlank() || !showed) {
+                    val tail = gameLogsTail()
                     if (tail.isNotBlank()) CwLog.warn("Игра завершилась с ошибкой:\n$tail")
-                    val message = explainCrash(tail, code)
+                    val message = when {
+                        storedError.isNotBlank() && storedError != "stop" -> storedError
+                        else -> explainCrash(tail, code)
+                    }
                     evaluate()
                     _state.update {
                         it.copy(phase = Phase.ERROR, detail = message.lineSequence().first(), info = message)
@@ -763,6 +828,18 @@ class Engine(private val app: Context) {
                 fail(e)
             }
         }
+    }
+
+    private fun gameLogsTail(): String {
+        val parts = game.outputLogs()
+        return parts.mapNotNull { file ->
+            if (!file.isFile) return@mapNotNull null
+            try {
+                file.readText().takeLast(8_000)
+            } catch (_: Exception) {
+                null
+            }
+        }.joinToString("\n")
     }
 
     private fun verifyThenRepair() {
@@ -786,6 +863,7 @@ class Engine(private val app: Context) {
             return false
         }
         cancel.set(false)
+        deletePartialOnCancel = false
         _state.update {
             it.copy(
                 busy = true,
@@ -800,6 +878,23 @@ class Engine(private val app: Context) {
         }
         WorkService.show(app, name)
         return true
+    }
+
+    private fun deleteCancelledDownloads() {
+        fun parts(dir: File) {
+            if (!dir.isDirectory) return
+            dir.listFiles()?.forEach { file ->
+                if (file.isDirectory) {
+                    if (file.name == "jre") return@forEach
+                    parts(file)
+                } else if (file.name.endsWith(".part") || file.name.endsWith(".drv")) {
+                    file.delete()
+                }
+            }
+        }
+        parts(AppPaths.root)
+        val version = cfg.minecraftVersion
+        if (!installer.versionReady(version)) deleteTree(AppPaths.game(version))
     }
 
     private fun endBusy() {
@@ -826,8 +921,12 @@ class Engine(private val app: Context) {
             message = "Нет связи с серверами Minecraft. Уже скачанное сохранено, нажмите ещё раз."
         }
         val cancelled = cancel.get() || message == "Отменено"
-        if (cancelled) CwLog.warn("Операция отменена") else CwLog.warn("Ошибка: $message\n${e.stackTraceToString().take(2000)}")
+        val wipe = cancelled && deletePartialOnCancel
+        deletePartialOnCancel = false
+        if (cancelled) CwLog.warn(if (wipe) "Загрузка отменена, файлы удалены" else "Загрузка остановлена, скачанное сохранено")
+        else CwLog.warn("Ошибка: $message\n${e.stackTraceToString().take(2000)}")
         endBusy()
+        if (wipe) deleteCancelledDownloads()
         if (cancelled) {
             evaluate()
         } else {
@@ -842,14 +941,44 @@ class Engine(private val app: Context) {
         if (log.contains("UnsupportedClassVersionError")) {
             return "Не удалось запустить Minecraft.\n\nПричина:\nНужна Java 17.\n\nФайл:\nJava runtime"
         }
-        val line = log.lineSequence().map { it.trim() }.firstOrNull {
-            it.contains("Exception") || it.startsWith("Caused by:") || it.contains("dlopen failed") || it.contains("Abort")
+        val line = log.lineSequence().map { it.trim().trimStart('#', ' ') }.firstOrNull {
+            val text = it.trim()
+            if (text.isEmpty() || text.startsWith("A fatal error has been detected", true)) false
+            else text.contains("Exception") || text.startsWith("Caused by:") || text.contains("dlopen failed")
+                || text.contains("CANNOT LINK EXECUTABLE")
+                || text.contains("SIGSEGV") || text.contains("SIGABRT") || text.contains("Internal Error")
+                || text.contains("Problematic frame") || text.contains("Could not reserve")
+                || text.contains("Unrecognized VM option") || text.contains("libc.so.6")
+                || (text.contains("UnsatisfiedLinkError") && !text.contains("already", true))
+                || text.contains("OutOfMemory")
+                || text.contains("Failed to initialize GLFW") || text.contains("Failed to create the GLFW window")
+                || text.contains("couldn't locate the game") || text.contains("Failed to attach")
+                || text.contains("окно Minecraft не создано") || text.contains("завершился с ошибкой")
         }
-        return if (line.isNullOrBlank()) {
-            "Игра закрылась с кодом $code. Подробности записаны в лог."
-        } else {
-            "Не удалось запустить Minecraft.\n\nПричина:\n${line.take(220)}\n\nПодробности записаны в лог."
+        val reported = line ?: crashReportLine()
+        val tailLine = log.lineSequence().map { it.trim() }.filter { it.isNotEmpty() }.toList().takeLast(8)
+            .joinToString("\n")
+        if (!reported.isNullOrBlank()) {
+            return "Не удалось запустить Minecraft.\n\nПричина:\n${reported.take(220)}\n\nПодробности записаны в лог."
         }
+        if (tailLine.isNotBlank()) {
+            return "Minecraft закрылся, не открыв окно.\n\nПоследние строки:\n${tailLine.take(700)}"
+        }
+        if (code == 134) {
+            return "Игра закрылась с кодом 134. Java была остановлена при запуске. Подробности записаны в лог."
+        }
+        return "Minecraft закрылся внутри графической библиотеки, окно не создано. Код $code."
+    }
+
+    private fun crashReportLine(): String? {
+        val files = mutableListOf(File(AppPaths.logs, "hs_err.log"))
+        AppPaths.logs.listFiles()?.filterTo(files) { it.name.startsWith("hs_err") && it.isFile }
+        AppPaths.game(cfg.minecraftVersion).listFiles()?.filterTo(files) { it.name.startsWith("hs_err") && it.isFile }
+        val text = files.filter { it.isFile && it.length() > 0 }.maxByOrNull { it.lastModified() }?.readText()?.take(12_000)
+            ?: return null
+        val lines = text.lineSequence().map { it.trim().trimStart('#', ' ') }.filter { it.isNotBlank() }.toList()
+        return lines.firstOrNull { it.contains("Problematic frame") || it.contains("Internal Error") || it.contains("SIGSEGV") || it.contains("SIGABRT") }
+            ?: lines.firstOrNull { it.startsWith("C ") || it.startsWith("V ") || it.startsWith("j ") }
     }
 
     private fun setPhase(phase: Phase, detail: String) {
